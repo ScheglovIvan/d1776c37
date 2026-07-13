@@ -1,0 +1,88 @@
+workflows:
+  ios-unsigned:
+    name: iOS Unsigned (sideload / jailbreak)
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      flutter: 3.44.4
+      xcode: latest
+      cocoapods: default
+    scripts:
+      - name: Scaffold platform folders
+        script: flutter create --platforms=ios,android .
+      - name: Set iOS deployment target 13.0
+        script: |
+          # RevenueCat / purchases_flutter use Swift concurrency (iOS 13+); the
+          # flutter-create default (12.0) fails to compile. Force 13.0 in the Podfile
+          # platform AND inside post_install so EVERY pod target is bumped before build.
+          sed -i '' "s/^# *platform :ios.*/platform :ios, '13.0'/" ios/Podfile || true
+          sed -i '' "s/platform :ios, '[0-9.]*'/platform :ios, '13.0'/" ios/Podfile || true
+          perl -0pi -e "s/flutter_additional_ios_build_settings\(target\)/flutter_additional_ios_build_settings(target)\n      target.build_configurations.each { |c| c.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '13.0' }/g" ios/Podfile || true
+          sed -i '' "s/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*/IPHONEOS_DEPLOYMENT_TARGET = 13.0/g" ios/Runner.xcodeproj/project.pbxproj || true
+      - name: Set display name and Android identity
+        script: |
+          # Display name (user-visible) + Android applicationId/label are written from
+          # the build profile. The iOS PRODUCT_BUNDLE_IDENTIFIER is intentionally left
+          # at the flutter-create default (com.example.*): a custom iOS bundle id makes
+          # Xcode automatic-signing demand a Development Team even for --no-codesign, so
+          # the real iOS bundle id is applied together with signing (real profile, once
+          # Apple credentials are configured). App / com.batteam.app are per-job.
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName App" ios/Runner/Info.plist             || /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string App" ios/Runner/Info.plist
+          sed -i '' 's/applicationId "[^"]*"/applicationId "com.batteam.app"/' android/app/build.gradle || true
+          sed -i '' 's/android:label="[^"]*"/android:label="App"/' android/app/src/main/AndroidManifest.xml || true
+      - name: Inject iOS permission usage descriptions
+        script: |
+          # Real iOS permissions crash at runtime without their NS*UsageDescription in
+          # Info.plist. The generator emits ios_permissions.json (a flat {plist_key: reason}
+          # object, plus optional array values like UIBackgroundModes); apply each here after
+          # flutter create regenerated ios/. No file => nothing to do.
+          if [ -f ios_permissions.json ]; then
+            python3 - <<'PY'
+          import json, subprocess
+          PLIST = "ios/Runner/Info.plist"
+          def buddy(cmd):
+              return subprocess.run(["/usr/libexec/PlistBuddy", "-c", cmd, PLIST]).returncode
+          data = json.load(open("ios_permissions.json"))
+          for key, value in data.items():
+              if isinstance(value, list):
+                  buddy(f"Delete :{key}")
+                  buddy(f"Add :{key} array")
+                  for i, item in enumerate(value):
+                      buddy(f"Add :{key}:{i} string {item}")
+              else:
+                  text = str(value)
+                  if buddy(f"Set :{key} {text}") != 0:
+                      buddy(f"Add :{key} string {text}")
+          print("applied", len(data), "iOS permission key(s)")
+          PY
+          fi
+      - name: Pin RevenueCat SDK
+        script: |
+          # purchases_flutter < 8 fails to compile on current Xcode with
+          # "'SubscriptionPeriod' is ambiguous". Codegen sometimes writes an older
+          # constraint from the source app; force a known-good one at build time so no
+          # regeneration can reintroduce the break. No-op if the package isn't used.
+          sed -i '' -E "s/^([[:space:]]*purchases_flutter:).*/\1 ^8.0.0/" pubspec.yaml || true
+      - name: Get Flutter packages
+        script: flutter pub get
+      - name: Install CocoaPods
+        script: find . -name Podfile -execdir pod install \; || true
+      - name: Build unsigned iOS
+        script: |
+          # `flutter build ios --no-codesign` still fails on this CI ("requires a
+          # Development Team") for release. Configure with flutter, then build via
+          # xcodebuild with signing disabled on the command line (highest precedence,
+          # overrides the project's automatic-signing settings) — a true unsigned .app.
+          flutter build ios --release --no-codesign --config-only
+          xcodebuild -workspace ios/Runner.xcworkspace -scheme Runner             -configuration Release -sdk iphoneos -derivedDataPath build/ios_dd             CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO             CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="" PROVISIONING_PROFILE_SPECIFIER=""             build
+      - name: Package unsigned IPA
+        script: |
+          APP="$(find build/ios_dd -path '*/Release-iphoneos/Runner.app' -type d | head -1)"
+          if [ -z "$APP" ]; then APP="$(find build -name Runner.app -type d | head -1)"; fi
+          mkdir -p build/ios/iphoneos/Payload
+          cp -R "$APP" build/ios/iphoneos/Payload/
+          cd build/ios/iphoneos && zip -r app-unsigned.ipa Payload
+    artifacts:
+      - build/ios/iphoneos/*.ipa
+      - build/ios/iphoneos/Runner.app
+      - flutter_drive.log
